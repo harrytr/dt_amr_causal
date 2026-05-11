@@ -1,0 +1,27 @@
+{
+  "selection_direction": "auto",
+  "default_action_cost": 0.0,
+  "default_cooldown_days": 0,
+  "default_max_uses": null,
+  "budget_total": null,
+  "action_rules_by_id": {
+    "baseline": {
+      "action_name": "baseline",
+      "cost": 0.0,
+      "cooldown_days": 0,
+      "max_uses": null
+    }
+  },
+  "action_rules_by_name": {
+    "set_screening_frequency": {
+      "cost": 1.0,
+      "cooldown_days": 7,
+      "max_uses": null
+    },
+    "set_isolation_parameters": {
+      "cost": 1.5,
+      "cooldown_days": 7,
+      "max_uses": null
+    }
+  }
+}

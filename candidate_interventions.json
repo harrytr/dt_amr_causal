@@ -1,0 +1,58 @@
+[
+  {
+    "name": "set_screening_frequency",
+    "display_name": "Screen 2d delay 0d + iso resistant only, mult 0.75, 3d",
+    "target_type": "global",
+    "target_id": "hospital",
+    "params": {
+      "frequency_days": 2,
+      "screen_on_admission": 1,
+      "screen_result_delay_days": 0,
+      "isolation_mult": 0.75,
+      "isolation_days": 3,
+      "isolation_trigger_policy": "resistant_only"
+    }
+  },
+  {
+    "name": "set_screening_frequency",
+    "display_name": "Screen 7d delay 2d + iso resistant only, mult 0.75, 3d",
+    "target_type": "global",
+    "target_id": "hospital",
+    "params": {
+      "frequency_days": 7,
+      "screen_on_admission": 1,
+      "screen_result_delay_days": 2,
+      "isolation_mult": 0.75,
+      "isolation_days": 3,
+      "isolation_trigger_policy": "resistant_only"
+    }
+  },
+  {
+    "name": "set_screening_frequency",
+    "display_name": "Screen 2d delay 0d + iso all positives, mult 0.75, 3d",
+    "target_type": "global",
+    "target_id": "hospital",
+    "params": {
+      "frequency_days": 2,
+      "screen_on_admission": 1,
+      "screen_result_delay_days": 0,
+      "isolation_mult": 0.75,
+      "isolation_days": 3,
+      "isolation_trigger_policy": "all_positives"
+    }
+  },
+  {
+    "name": "set_screening_frequency",
+    "display_name": "Screen 7d delay 2d + iso all positives, mult 0.75, 3d",
+    "target_type": "global",
+    "target_id": "hospital",
+    "params": {
+      "frequency_days": 7,
+      "screen_on_admission": 1,
+      "screen_result_delay_days": 2,
+      "isolation_mult": 0.75,
+      "isolation_days": 3,
+      "isolation_trigger_policy": "all_positives"
+    }
+  }
+]
