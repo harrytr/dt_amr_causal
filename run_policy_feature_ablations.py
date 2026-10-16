@@ -1,42 +1,69 @@
 #!/usr/bin/env python3
 """
-Standalone feature-ablation runner for the AMR causal policy pipeline.
+Standalone feature-ablation runner for Reviewer 2, Comment 7 of the AMR
+causal policy pipeline.
 
+Primary Reviewer 2 Comment 7 variants
+-------------------------------------
+1) full
+   Temporal graph + 49-feature state summary + 35-feature action descriptor.
+   The 35 action features are the original 33 descriptors plus two explicit
+   isolation-trigger indicators: resistant-only and all-positive.
+
+2) graph_action
+   Temporal graph + 35-feature action descriptor; no explicit state-summary
+   branch.
+
+3) summary_action
+   49-feature state summary + 35-feature action descriptor; graph information
+   is disabled. The graph tensors remain available only so the existing data
+   pipeline can construct the state summary consistently.
+
+4) no_trigger
+   Full temporal graph + state summary + the original 33-feature action
+   descriptor, i.e. the same architecture without the two explicit trigger
+   indicators.
+
+The script leaves the repository and saved causal dataset unchanged. It
+monkey-patches the action representation and ablation behavior only inside
+isolated worker processes, retrains each requested ablation from C2 onward,
+and evaluates it with the repository's existing policy evaluator.
+
+Matched current causal configuration
+------------------------------------
+Run once for the ground-truth causal dataset and once for the
+partial-observation causal dataset.
+
+Ground truth example:
 
 python run_policy_feature_ablations.py \
   --project_root "/Users/harrytriantafyllidis/AMR_MILP" \
   --data_folder "/Users/harrytriantafyllidis/AMR_MILP/experiments_causal_results/TRACK_ground_truth/work/causal_policy_monthly_shock_superspreader" \
-  --out_root "/Users/harrytriantafyllidis/AMR_MILP/ablation_runs" \
+  --out_root "/Users/harrytriantafyllidis/AMR_MILP/ablation_runs/ground_truth" \
   --task oracle_best_action_h7 \
   --oracle_metric auto \
   --candidate_interventions_json "/Users/harrytriantafyllidis/AMR_MILP/candidate_interventions.json" \
   --primary_metric policy_accuracy \
   --tolerance 0.01 \
-  --train_extra "--T 7 --sliding_step 1 --hidden 32 --heads 2 --dropout 0.2 --transformer_layers 2 --sage_layers 2 --batch_size 16 --epochs 50 --lr 1e-4 --neighbor_sampling false --num_neighbors 15,10 --seed_count 256 --seed_strategy random --seed_batch_size 64 --max_sub_batches 4 --use_action_conditioning true --aux_policy_loss false --pairwise_policy_ranking_loss false --oracle_best_action_loss true --emit_translational_figures false"
+  --train_extra "--T 7 --sliding_step 1 --hidden 128 --heads 2 --dropout 0.2 --transformer_layers 2 --sage_layers 4 --batch_size 8 --epochs 100 --lr 1e-4 --neighbor_sampling false --num_neighbors 20,10 --seed_count 256 --seed_strategy random --seed_batch_size 64 --max_sub_batches 4 --use_action_conditioning true --action_hidden_dim 256 --action_interaction_hidden_dim 256 --action_interaction_dropout 0.1 --aux_policy_loss false --pairwise_policy_ranking_loss true --pairwise_policy_ranking_weight 1 --pairwise_policy_margin 0.02 --pairwise_policy_min_target_gap 0.01 --oracle_best_action_loss true --emit_translational_figures false"
 
-What it does
-------------
-- Leaves the existing codebase untouched.
-- Uses the existing dataset and runs from C2 onward only:
-  1) train_amr_dygformer.py
-  2) evaluate_policy_selector.py
-- Applies feature ablations at runtime via monkey-patching inside an isolated
-  worker process.
-- Aggregates results across ablations.
-- Identifies the smallest tested feature set that stays within a user-defined
-  tolerance of the best primary metric.
-- Writes CSV/JSON summaries and a publication-ready LaTeX table.
+By default only the four primary variants above are run. The legacy ablation
+variants are retained and can still be requested
+explicitly with --variants.
 
-Typical use
------------
-python run_policy_feature_ablations.py \
-  --project_root /path/to/AMR_V2-MILP_CLS_PRO \
-  --data_folder /path/to/causal_policy_dataset \
-  --out_root /path/to/ablation_results \
-  --task oracle_best_action_h14 \
-  --oracle_metric auto \
-  --candidate_interventions_json /path/to/candidate_interventions.json \
-  --train_extra "--T 14 --sliding_step 1 --hidden 32 --heads 2 --dropout 0.2 --transformer_layers 2 --sage_layers 2 --batch_size 16 --epochs 50 --lr 1e-4 --neighbor_sampling false --seed_count 256 --seed_strategy random --seed_batch_size 64 --max_sub_batches 4 --use_action_conditioning true --aux_policy_loss false --pairwise_policy_ranking_loss false --oracle_best_action_loss true --emit_translational_figures false"
+Root-level outputs
+------------------
+- ablation_results.csv
+- ablation_results.json
+- ablation_results_table.tex
+- ablation_summary.txt
+- feature_catalog.json
+- ablation_action_counts.csv
+- ablation_per_state_selections.csv
+- ablation_action_scores_requested_split.csv
+- ablation_review_bundle.zip
+
+Each variant also retains its own train/, eval/, and meta/ directories.
 """
 
 from __future__ import annotations
@@ -138,6 +165,8 @@ ACTION_FEATURES: List[str] = [
     "action_name_hash",
     "action_id_hash",
     "target_hash",
+    "trigger_resistant_only",
+    "trigger_all_positives",
 ]
 
 STATE_FEATURES: List[str] = [
@@ -199,6 +228,7 @@ ACTION_BLOCKS: Dict[str, List[str]] = {
     "flags": ACTION_FEATURES[18:20],
     "numeric": ACTION_FEATURES[20:30],
     "hash": ACTION_FEATURES[30:33],
+    "trigger": ACTION_FEATURES[33:35],
 }
 
 STATE_BLOCKS: Dict[str, List[str]] = {
@@ -239,6 +269,7 @@ class VariantSpec:
     keep_state: Tuple[str, ...]
     keep_action: Tuple[str, ...]
     use_action_conditioning: bool = True
+    disable_graph_information: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -250,6 +281,7 @@ class VariantSpec:
             "keep_state": list(self.keep_state),
             "keep_action": list(self.keep_action),
             "use_action_conditioning": bool(self.use_action_conditioning),
+            "disable_graph_information": bool(self.disable_graph_information),
         }
 
 
@@ -271,6 +303,43 @@ def _latex_escape(text: Any) -> str:
     for old, new in replacements.items():
         out = out.replace(old, new)
     return out
+
+
+def _trigger_bits_from_manifest_row(row: Dict[str, Any]) -> Tuple[float, float]:
+    """Return explicit resistant-only/all-positive trigger indicators.
+
+    Baseline carries no intervention-specific trigger bit. Every non-baseline
+    action in the current policy menu must declare its isolation trigger
+    explicitly in action_intervention_json.
+    """
+    is_baseline = str(row.get("is_baseline", "0")).strip().lower() in {"1", "true"}
+    if is_baseline:
+        return 0.0, 0.0
+
+    raw_payload = row.get("action_intervention_json", "") or ""
+    if isinstance(raw_payload, dict):
+        payload = raw_payload
+    else:
+        try:
+            payload = json.loads(str(raw_payload)) if str(raw_payload).strip() else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid action_intervention_json while constructing trigger indicators.") from exc
+
+    if not isinstance(payload, dict):
+        payload = {}
+    params = payload.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+
+    trigger = str(params.get("isolation_trigger_policy", "")).strip().lower()
+    if trigger not in {"resistant_only", "all_positives"}:
+        action_id = str(row.get("action_id", row.get("action_name", "<unknown>")))
+        raise ValueError(
+            f"Non-baseline action {action_id!r} does not explicitly define "
+            "params.isolation_trigger_policy as 'resistant_only' or 'all_positives'."
+        )
+
+    return float(trigger == "resistant_only"), float(trigger == "all_positives")
 
 
 def _safe_float(x: Any, default: float = float("nan")) -> float:
@@ -304,12 +373,21 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return obj
 
 
+DEFAULT_VARIANT_NAMES: Tuple[str, ...] = (
+    "full",
+    "graph_action",
+    "summary_action",
+    "no_trigger",
+)
+
+
 def _default_variants() -> List[VariantSpec]:
     all_node_gt = tuple(NODE_FEATURES_GROUND_TRUTH)
     all_node_po = tuple(NODE_FEATURES_PARTIAL_OBS)
     all_edge = tuple(EDGE_FEATURES)
     all_state = tuple(STATE_FEATURES)
     all_action = tuple(ACTION_FEATURES)
+    original_action_33 = tuple(ACTION_FEATURES[:33])
 
     action_no_hash = tuple([f for f in ACTION_FEATURES if f not in ACTION_BLOCKS["hash"]])
     state_no_op = tuple([f for f in STATE_FEATURES if f not in STATE_BLOCKS["operational_context"]])
@@ -317,42 +395,82 @@ def _default_variants() -> List[VariantSpec]:
     action_family_numeric = tuple(ACTION_BLOCKS["family"] + ACTION_BLOCKS["numeric"])
 
     node_core_gt = tuple(
-        NODE_BLOCKS_GROUND_TRUTH["role_state"] + NODE_BLOCKS_GROUND_TRUTH["burden"] + NODE_BLOCKS_GROUND_TRUTH["ward"]
+        NODE_BLOCKS_GROUND_TRUTH["role_state"]
+        + NODE_BLOCKS_GROUND_TRUTH["burden"]
+        + NODE_BLOCKS_GROUND_TRUTH["ward"]
     )
     node_core_po = tuple(
-        NODE_BLOCKS_PARTIAL_OBS["role_state"] + NODE_BLOCKS_PARTIAL_OBS["burden"] + NODE_BLOCKS_PARTIAL_OBS["ward"]
+        NODE_BLOCKS_PARTIAL_OBS["role_state"]
+        + NODE_BLOCKS_PARTIAL_OBS["burden"]
+        + NODE_BLOCKS_PARTIAL_OBS["ward"]
     )
 
     variants = [
         VariantSpec(
             name="full",
-            description="All currently engineered features.",
+            description="Temporal graph + state summary + 35-feature action descriptor with explicit trigger indicators.",
             keep_node_gt=all_node_gt,
             keep_node_po=all_node_po,
             keep_edge=all_edge,
             keep_state=all_state,
             keep_action=all_action,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
-            name="no_state_summary",
-            description="Remove the explicit handcrafted state-summary branch entirely.",
+            name="graph_action",
+            description="Temporal graph + 35-feature action descriptor; explicit state-summary branch removed.",
             keep_node_gt=all_node_gt,
             keep_node_po=all_node_po,
             keep_edge=all_edge,
             keep_state=tuple(),
             keep_action=all_action,
             use_action_conditioning=True,
+            disable_graph_information=False,
+        ),
+        VariantSpec(
+            name="summary_action",
+            description="State summary + 35-feature action descriptor; temporal graph information disabled.",
+            keep_node_gt=all_node_gt,
+            keep_node_po=all_node_po,
+            keep_edge=all_edge,
+            keep_state=all_state,
+            keep_action=all_action,
+            use_action_conditioning=True,
+            disable_graph_information=True,
+        ),
+        VariantSpec(
+            name="no_trigger",
+            description="Full model with the original 33-feature action descriptor; explicit trigger indicators removed.",
+            keep_node_gt=all_node_gt,
+            keep_node_po=all_node_po,
+            keep_edge=all_edge,
+            keep_state=all_state,
+            keep_action=original_action_33,
+            use_action_conditioning=True,
+            disable_graph_information=False,
+        ),
+        VariantSpec(
+            name="no_state_summary",
+            description="Legacy alias-style ablation: remove the explicit handcrafted state-summary branch entirely.",
+            keep_node_gt=all_node_gt,
+            keep_node_po=all_node_po,
+            keep_edge=all_edge,
+            keep_state=tuple(),
+            keep_action=all_action,
+            use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="no_action_hashes",
-            description="Drop hashed action identity features only.",
+            description="Drop hashed action identity features only while retaining explicit trigger indicators.",
             keep_node_gt=all_node_gt,
             keep_node_po=all_node_po,
             keep_edge=all_edge,
             keep_state=all_state,
             keep_action=action_no_hash,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="no_state_op_context",
@@ -363,6 +481,7 @@ def _default_variants() -> List[VariantSpec]:
             keep_state=state_no_op,
             keep_action=all_action,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="action_family_only",
@@ -373,16 +492,18 @@ def _default_variants() -> List[VariantSpec]:
             keep_state=all_state,
             keep_action=action_family_only,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="action_family_numeric",
-            description="Keep family plus numeric intervention parameters; remove target IDs, flags, and hashes.",
+            description="Keep family plus numeric intervention parameters; remove target IDs, flags, hashes, and trigger bits.",
             keep_node_gt=all_node_gt,
             keep_node_po=all_node_po,
             keep_edge=all_edge,
             keep_state=all_state,
             keep_action=action_family_numeric,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="lean_no_state_no_hash",
@@ -393,6 +514,7 @@ def _default_variants() -> List[VariantSpec]:
             keep_state=tuple(),
             keep_action=action_no_hash,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="lean_action_family_numeric_no_state",
@@ -403,6 +525,7 @@ def _default_variants() -> List[VariantSpec]:
             keep_state=tuple(),
             keep_action=action_family_numeric,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
         VariantSpec(
             name="node_core_plus_action_family_numeric_no_state",
@@ -413,6 +536,7 @@ def _default_variants() -> List[VariantSpec]:
             keep_state=tuple(),
             keep_action=action_family_numeric,
             use_action_conditioning=True,
+            disable_graph_information=False,
         ),
     ]
     return variants
@@ -421,7 +545,7 @@ def _default_variants() -> List[VariantSpec]:
 def _resolve_variants(names: Optional[Sequence[str]]) -> List[VariantSpec]:
     catalog = {v.name: v for v in _default_variants()}
     if not names:
-        return list(catalog.values())
+        return [catalog[name] for name in DEFAULT_VARIANT_NAMES]
     selected: List[VariantSpec] = []
     for name in names:
         key = str(name).strip()
@@ -434,14 +558,18 @@ def _resolve_variants(names: Optional[Sequence[str]]) -> List[VariantSpec]:
 
 
 def _count_dims(spec: VariantSpec) -> Dict[str, int]:
+    graph_gt_dim = 0 if spec.disable_graph_information else len(spec.keep_node_gt) + len(spec.keep_edge)
+    graph_po_dim = 0 if spec.disable_graph_information else len(spec.keep_node_po) + len(spec.keep_edge)
+    action_dim = len(spec.keep_action) if spec.use_action_conditioning else 0
     return {
         "node_gt_dim": len(spec.keep_node_gt),
         "node_po_dim": len(spec.keep_node_po),
         "edge_dim": len(spec.keep_edge),
         "state_dim": len(spec.keep_state),
-        "action_dim": len(spec.keep_action) if spec.use_action_conditioning else 0,
-        "total_dim_gt": len(spec.keep_node_gt) + len(spec.keep_edge) + len(spec.keep_state) + (len(spec.keep_action) if spec.use_action_conditioning else 0),
-        "total_dim_po": len(spec.keep_node_po) + len(spec.keep_edge) + len(spec.keep_state) + (len(spec.keep_action) if spec.use_action_conditioning else 0),
+        "action_dim": action_dim,
+        "graph_information_enabled": not bool(spec.disable_graph_information),
+        "total_dim_gt": graph_gt_dim + len(spec.keep_state) + action_dim,
+        "total_dim_po": graph_po_dim + len(spec.keep_state) + action_dim,
     }
 
 
@@ -529,8 +657,13 @@ def _build_eval_cli_args(args: argparse.Namespace, variant: VariantSpec, train_o
 
 def _render_feature_keep_description(spec: VariantSpec, state_mode: str) -> str:
     node_dim = len(spec.keep_node_gt) if state_mode == "ground_truth" else len(spec.keep_node_po)
+    graph_desc = (
+        f"{node_dim} node + {len(spec.keep_edge)} edge"
+        if not spec.disable_graph_information
+        else "disabled"
+    )
     pieces = [
-        f"normal={node_dim} node + {len(spec.keep_edge)} edge",
+        f"normal={graph_desc}",
         f"state={len(spec.keep_state)}",
         f"intervention={(len(spec.keep_action) if spec.use_action_conditioning else 0)}",
     ]
@@ -560,7 +693,12 @@ def _generate_latex_table(rows: List[Dict[str, Any]], state_mode: str, primary_m
 
     body_lines: List[str] = []
     for row in rows:
-        normal_dim = row.get("node_gt_dim", 0) + row.get("edge_dim", 0) if state_mode == "ground_truth" else row.get("node_po_dim", 0) + row.get("edge_dim", 0)
+        if not bool(row.get("graph_information_enabled", True)):
+            normal_dim = 0
+        elif state_mode == "ground_truth":
+            normal_dim = row.get("node_gt_dim", 0) + row.get("edge_dim", 0)
+        else:
+            normal_dim = row.get("node_po_dim", 0) + row.get("edge_dim", 0)
         state_dim = row.get("state_dim", 0)
         action_dim = row.get("action_dim", 0)
         primary = _safe_float(row.get("primary_metric_value"))
@@ -626,6 +764,7 @@ def _worker_main() -> int:
     keep_edge = list(variant_payload.get("keep_edge", []))
     keep_state = list(variant_payload.get("keep_state", []))
     keep_action = list(variant_payload.get("keep_action", []))
+    disable_graph_information = bool(variant_payload.get("disable_graph_information", False))
 
     node_idx_gt = [NODE_FEATURES_GROUND_TRUTH.index(x) for x in keep_node_gt]
     node_idx_po = [NODE_FEATURES_PARTIAL_OBS.index(x) for x in keep_node_po]
@@ -704,7 +843,33 @@ def _worker_main() -> int:
         return full.new_zeros((0,), dtype=torch.float32)
 
     def patched_action_builder(row: Dict[str, Any]):
-        full = orig_action_builder(row).to(torch.float32).view(-1)
+        original = orig_action_builder(row).to(torch.float32).view(-1)
+
+        # Current submitted repository: 33 original action descriptors.
+        # Revised Comment 7 full representation: append two explicit trigger bits.
+        if int(original.numel()) == 33:
+            trigger_bits = torch.tensor(
+                _trigger_bits_from_manifest_row(row),
+                dtype=torch.float32,
+                device=original.device,
+            )
+            full = torch.cat([original, trigger_bits], dim=0)
+        elif int(original.numel()) == 35:
+            # Forward-compatible path if the repository itself has already been
+            # updated to the same 35-feature representation.
+            full = original
+        else:
+            raise ValueError(
+                "Unexpected action descriptor width from temporal_graph_dataset: "
+                f"{int(original.numel())}; expected 33 or 35."
+            )
+
+        if int(full.numel()) != len(ACTION_FEATURES):
+            raise ValueError(
+                f"Internal action-feature catalog mismatch: got {int(full.numel())}, "
+                f"expected {len(ACTION_FEATURES)}."
+            )
+
         if action_idx:
             return full[action_idx].contiguous()
         return full.new_zeros((0,), dtype=torch.float32)
@@ -712,6 +877,37 @@ def _worker_main() -> int:
     tgd.TemporalGraphDataset._load_graph = patched_load_graph
     tgd._build_state_summary_features_from_graph = patched_state_builder
     tgd._build_action_features_from_manifest_row = patched_action_builder
+
+    if disable_graph_information:
+        import models_amr as models_module  # type: ignore
+
+        def patched_encode_day_graphs(self, graphs, return_attention: bool = False):
+            if not graphs:
+                raise ValueError("summary_action requires a non-empty graph history.")
+            first_graph = graphs[0]
+            x = getattr(first_graph, "x", None)
+            if not torch.is_tensor(x):
+                raise ValueError("Could not determine graph tensor device for summary_action.")
+
+            num_graphs = getattr(first_graph, "num_graphs", None)
+            if num_graphs is None:
+                batch = getattr(first_graph, "batch", None)
+                if torch.is_tensor(batch) and batch.numel() > 0:
+                    num_graphs = int(batch.max().item()) + 1
+                else:
+                    num_graphs = 1
+
+            dtype = next(self.parameters()).dtype
+            zero_history = torch.zeros(
+                (int(num_graphs), len(graphs), int(self.hidden_channels)),
+                device=x.device,
+                dtype=dtype,
+            )
+            if return_attention:
+                return zero_history, [None for _ in graphs]
+            return zero_history
+
+        models_module.AMRDyGFormer.encode_day_graphs = patched_encode_day_graphs
 
     import train_amr_dygformer  # type: ignore
     import evaluate_policy_selector  # type: ignore
@@ -753,9 +949,127 @@ def _worker_main() -> int:
         "train_error": train_error,
         "eval_error": eval_error,
         "eval_summary": summary,
+        "disable_graph_information": disable_graph_information,
     }
     _write_json(Path(args.worker_result_json), payload)
     return 0 if (train_exit == 0 and eval_exit == 0) else 1
+
+
+def _read_csv_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_csv_rows(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    rows_list = [dict(row) for row in rows]
+    if not rows_list:
+        path.write_text("", encoding="utf-8")
+        return
+    fieldnames = list(dict.fromkeys(key for row in rows_list for key in row.keys()))
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_list)
+
+
+def _aggregate_reviewer_outputs(rows: Sequence[Dict[str, Any]], out_root: Path) -> List[Path]:
+    action_count_rows: List[Dict[str, Any]] = []
+    per_state_rows: List[Dict[str, Any]] = []
+    action_score_rows: List[Dict[str, Any]] = []
+
+    for row in rows:
+        variant = str(row.get("variant", ""))
+        if str(row.get("status", "")) != "ok":
+            continue
+
+        display_map: Dict[str, Any] = {}
+        try:
+            display_map = json.loads(str(row.get("action_display_name_map_json", "{}")))
+        except Exception:
+            display_map = {}
+
+        for source_name, kind in (
+            ("predicted_action_counts_json", "predicted"),
+            ("oracle_action_counts_json", "oracle"),
+        ):
+            try:
+                counts = json.loads(str(row.get(source_name, "{}")))
+            except Exception:
+                counts = {}
+            if isinstance(counts, dict):
+                for action_id, count in counts.items():
+                    action_count_rows.append(
+                        {
+                            "variant": variant,
+                            "count_type": kind,
+                            "action_id": str(action_id),
+                            "action_display_name": str(display_map.get(str(action_id), "")),
+                            "count": int(count),
+                        }
+                    )
+
+        eval_dir = Path(str(row.get("eval_dir", "")))
+        if not eval_dir.exists():
+            continue
+
+        for item in _read_csv_rows(eval_dir / "policy_selection_per_state_requested_split.csv"):
+            merged = {"variant": variant}
+            merged.update(item)
+            per_state_rows.append(merged)
+
+        for item in _read_csv_rows(eval_dir / "policy_action_scores_requested_split.csv"):
+            merged = {"variant": variant}
+            merged.update(item)
+            action_score_rows.append(merged)
+
+    action_counts_path = out_root / "ablation_action_counts.csv"
+    per_state_path = out_root / "ablation_per_state_selections.csv"
+    action_scores_path = out_root / "ablation_action_scores_requested_split.csv"
+
+    _write_csv_rows(action_counts_path, action_count_rows)
+    _write_csv_rows(per_state_path, per_state_rows)
+    _write_csv_rows(action_scores_path, action_score_rows)
+
+    return [action_counts_path, per_state_path, action_scores_path]
+
+
+def _write_review_bundle(out_root: Path, files: Sequence[Path], rows: Sequence[Dict[str, Any]]) -> Path:
+    import zipfile
+
+    bundle_path = out_root / "ablation_review_bundle.zip"
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        seen: set = set()
+
+        def add_file(path: Path, arcname: Optional[str] = None) -> None:
+            if not path.exists() or not path.is_file():
+                return
+            resolved = path.resolve()
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            zf.write(path, arcname=arcname or path.name)
+
+        for path in files:
+            add_file(path)
+
+        for row in rows:
+            if str(row.get("status", "")) != "ok":
+                continue
+            variant = str(row.get("variant", "unknown"))
+            eval_dir = Path(str(row.get("eval_dir", "")))
+            for name in (
+                "policy_selection_summary.json",
+                "policy_selection_summary.txt",
+                "policy_selection_per_state_requested_split.csv",
+                "policy_action_scores_requested_split.csv",
+                "policy_selection_confusion_matrix.png",
+                "policy_regret_histogram.png",
+            ):
+                add_file(eval_dir / name, arcname=f"{variant}/eval/{name}")
+
+    return bundle_path
 
 
 def _master_main() -> int:
@@ -763,14 +1077,22 @@ def _master_main() -> int:
     parser.add_argument("--project_root", required=True, type=Path, help="Root directory of the AMR codebase.")
     parser.add_argument("--data_folder", required=True, type=Path, help="Causal policy dataset root containing policy_manifest.csv.")
     parser.add_argument("--out_root", required=True, type=Path, help="Output directory for ablation artifacts.")
-    parser.add_argument("--task", required=True, type=str, help="Training/evaluation task name, e.g. oracle_best_action_h14.")
+    parser.add_argument("--task", required=True, type=str, help="Training/evaluation task name, e.g. oracle_best_action_h7.")
     parser.add_argument("--oracle_metric", default="auto", type=str, help="Oracle metric passed to evaluate_policy_selector.py.")
     parser.add_argument("--selection_direction", default="auto", type=str, choices=["auto", "minimize", "maximize"])
     parser.add_argument("--candidate_interventions_json", default="", type=Path, help="Optional candidate_interventions.json for evaluation labels.")
     parser.add_argument("--train_extra", default="", type=str, help="Additional raw CLI args appended to train_amr_dygformer.py.")
     parser.add_argument("--eval_extra", default="", type=str, help="Additional raw CLI args appended to evaluate_policy_selector.py.")
     parser.add_argument("--eval_split", default="test", type=str, choices=["train", "validation", "val", "test"])
-    parser.add_argument("--variants", nargs="*", default=None, help="Optional subset of built-in variant names.")
+    parser.add_argument(
+        "--variants",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional subset of built-in variant names. Default: "
+            "full graph_action summary_action no_trigger."
+        ),
+    )
     parser.add_argument("--primary_metric", default="policy_accuracy", type=str, choices=["policy_accuracy", "strict_policy_accuracy", "top2_accuracy", "strict_top2_accuracy", "macro_f1", "weighted_f1", "accuracy"], help="Metric used to choose the minimal acceptable architecture.")
     parser.add_argument("--tolerance", default=0.01, type=float, help="Allowable drop from the best primary metric when choosing the smallest acceptable architecture.")
     parser.add_argument("--python_executable", default=sys.executable, type=str, help="Python executable to use for worker processes.")
@@ -863,6 +1185,18 @@ def _master_main() -> int:
             "median_regret": _safe_float((eval_summary.get("regret", {}) or {}).get("median")),
             "baseline_improvement_rate": _safe_float(eval_summary.get("baseline_improvement_rate")),
             "tie_state_rate": _safe_float(eval_summary.get("tie_state_rate")),
+            "predicted_action_counts_json": json.dumps(
+                eval_summary.get("predicted_action_counts", {}) or {},
+                sort_keys=True,
+            ),
+            "oracle_action_counts_json": json.dumps(
+                eval_summary.get("oracle_action_counts", {}) or {},
+                sort_keys=True,
+            ),
+            "action_display_name_map_json": json.dumps(
+                eval_summary.get("action_display_name_map", {}) or {},
+                sort_keys=True,
+            ),
             "macro_f1": _safe_float(classification_metrics.get("macro_f1")),
             "weighted_f1": _safe_float(classification_metrics.get("weighted_f1")),
             "accuracy": _safe_float(classification_metrics.get("accuracy")),
@@ -965,11 +1299,29 @@ def _master_main() -> int:
         lines.append("No variant completed successfully within the specified tolerance.")
     summary_txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    reviewer_paths = _aggregate_reviewer_outputs(rows, out_root)
+    bundle_path = _write_review_bundle(
+        out_root,
+        [
+            csv_path,
+            json_path,
+            tex_path,
+            summary_txt_path,
+            out_root / "feature_catalog.json",
+            *reviewer_paths,
+        ],
+        rows,
+    )
+
     print("Ablation study complete.", flush=True)
     print(f"Results CSV: {csv_path}", flush=True)
     print(f"Results JSON: {json_path}", flush=True)
     print(f"LaTeX table: {tex_path}", flush=True)
     print(f"Summary: {summary_txt_path}", flush=True)
+    print(f"Action counts: {reviewer_paths[0]}", flush=True)
+    print(f"Per-state selections: {reviewer_paths[1]}", flush=True)
+    print(f"Requested-split action scores: {reviewer_paths[2]}", flush=True)
+    print(f"Reviewer bundle: {bundle_path}", flush=True)
     return 0
 
 

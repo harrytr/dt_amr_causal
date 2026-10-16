@@ -6,11 +6,12 @@ experiments_causal.py
 
 Driver for the intervention-conditioned causal policy experiment.
 
-This script orchestrates four stages:
+This script orchestrates five stages:
   STEP C1: build the causal policy dataset
   STEP C2: train the action-conditioned temporal GNN
   STEP C3: evaluate policy selection on a held-out split
   STEP C4: optimize an intervention plan with a MILP over scored candidate actions
+  STEP C5: quantitatively evaluate cross-state score calibration and constrained allocation
 
 It also supports dual-track execution (ground_truth / partial_observation) and
 an Overleaf export similar in spirit to the pbc7 driver.
@@ -216,6 +217,22 @@ CONFIG: Dict[str, Any] = {
         "time_limit_sec": 300,
         "mip_gap": 0.0,
         "out_name": "policy_milp_large",
+    },
+
+    # C5 is a post-hoc analysis only. It consumes C1--C4 outputs and does not
+    # retrain or alter the primary causal policy experiment.
+    "C5": {
+        "out_name": "policy_milp_quantitative_eval",
+        "calibration_split": "validation",
+        "evaluation_split": "test",
+        "budget_fractions": "0.25,0.50,1.00",
+        "max_nonbaseline_fraction": 0.50,
+        "bootstrap_replicates": 2000,
+        "bootstrap_seed": 260928,
+        "calibration_bins": 8,
+        "time_limit_sec": 300,
+        "mip_gap": 0.0,
+        "force_validation_rescore": False,
     },
 }
 
@@ -604,6 +621,7 @@ def _paths(results_parent: Path) -> Dict[str, Path]:
     train_root = work_root / _safe_tag(str(CONFIG["TRAIN"]["out_name"]))
     eval_root = work_root / _safe_tag(str(CONFIG["EVAL"]["out_name"]))
     milp_root = work_root / _safe_tag(str(CONFIG["MILP"]["out_name"]))
+    c5_root = work_root / _safe_tag(str(CONFIG["C5"]["out_name"]))
     return {
         "track_root": track_root,
         "work_root": work_root,
@@ -611,6 +629,7 @@ def _paths(results_parent: Path) -> Dict[str, Path]:
         "train_root": train_root,
         "eval_root": eval_root,
         "milp_root": milp_root,
+        "c5_root": c5_root,
         "progress_json": track_root / "causal_progress.json",
         "summary_json": work_root / "causal_policy_experiment_summary.json",
     }
@@ -711,8 +730,8 @@ def _build_dataset_cmd(repo_root: Path, paths: Dict[str, Path]) -> List[str]:
     return cmd
 
 
-def _build_train_cmd(paths: Dict[str, Path]) -> List[str]:
-    cfg = _load_best_train_config_override(CONFIG)
+def _build_train_cmd(paths: Dict[str, Path], train_cfg_override: Optional[Dict[str, Any]] = None) -> List[str]:
+    cfg = dict(train_cfg_override) if train_cfg_override is not None else _load_best_train_config_override(CONFIG)
 
     cmd: List[str] = [
         sys.executable,
@@ -785,6 +804,14 @@ def _build_train_cmd(paths: Dict[str, Path]) -> List[str]:
         "--require_pt_metadata", "true" if bool(cfg.get("require_pt_metadata", True)) else "false",
         "--fail_on_noncontiguous", "true" if bool(cfg.get("fail_on_noncontiguous", True)) else "false",
     ])
+
+    # Repeat controls are opt-in; ordinary pipeline defaults are unchanged.
+    for key in ("model_seed", "eval_seed"):
+        if cfg.get(key) is not None:
+            cmd.extend([f"--{key}", str(int(cfg[key]))])
+    for key in ("deterministic", "metrics_only"):
+        if key in cfg:
+            cmd.extend([f"--{key}", "true" if cfg[key] else "false"])
 
     # Optional task-level hyperparameter override
     if bool(cfg.get("use_task_hparams", False)):
@@ -875,6 +902,32 @@ def _build_milp_cmd(repo_root: Path, paths: Dict[str, Path]) -> List[str]:
     return cmd
 
 
+def _build_c5_cmd(repo_root: Path, paths: Dict[str, Path]) -> List[str]:
+    cfg = CONFIG["C5"]
+    return [
+        sys.executable,
+        "evaluate_policy_milp_c5.py",
+        "--data_folder", str(paths["dataset_root"]),
+        "--trained_dir", str(paths["train_root"]),
+        "--eval_dir", str(paths["eval_root"]),
+        "--c4_milp_dir", str(paths["milp_root"]),
+        "--milp_config_json", str(_milp_config_json(repo_root)),
+        "--candidate_interventions_json", str(_candidate_interventions_json(repo_root)),
+        "--evaluator_script", str(repo_root / "evaluate_policy_selector.py"),
+        "--out_dir", str(paths["c5_root"]),
+        "--calibration_split", str(cfg.get("calibration_split", "validation")),
+        "--evaluation_split", str(cfg.get("evaluation_split", "test")),
+        "--budget_fractions", str(cfg.get("budget_fractions", "0.25,0.50,1.00")),
+        "--max_nonbaseline_fraction", str(float(cfg.get("max_nonbaseline_fraction", 0.50))),
+        "--bootstrap_replicates", str(int(cfg.get("bootstrap_replicates", 2000))),
+        "--bootstrap_seed", str(int(cfg.get("bootstrap_seed", 260928))),
+        "--calibration_bins", str(int(cfg.get("calibration_bins", 8))),
+        "--time_limit_sec", str(float(cfg.get("time_limit_sec", 300))),
+        "--mip_gap", str(float(cfg.get("mip_gap", 0.0))),
+        "--force_validation_rescore", "true" if bool(cfg.get("force_validation_rescore", False)) else "false",
+    ]
+
+
 # =============================================================================
 # Summaries / Overleaf export
 # =============================================================================
@@ -883,16 +936,19 @@ def _collect_summary(paths: Dict[str, Path]) -> Dict[str, Any]:
     train_metrics = _read_json_if_exists(paths["train_root"] / "metrics_summary.json")
     eval_summary = _read_json_if_exists(paths["eval_root"] / "policy_selection_summary.json")
     milp_summary = _read_json_if_exists(paths["milp_root"] / "milp_policy_summary.json")
+    c5_summary = _read_json_if_exists(paths["c5_root"] / "c5_summary.json")
     return {
         "state_mode": _state_mode_label(),
         "dataset_root": str(paths["dataset_root"]),
         "train_root": str(paths["train_root"]),
         "eval_root": str(paths["eval_root"]),
         "milp_root": str(paths["milp_root"]),
+        "c5_root": str(paths["c5_root"]),
         "dataset_summary": dataset_manifest,
         "train_metrics": train_metrics,
         "policy_eval_summary": eval_summary,
         "milp_summary": milp_summary,
+        "c5_summary": c5_summary,
     }
 
 
@@ -1031,13 +1087,14 @@ def _execute_single_track(results_parent: Path, dry: bool, start_step: int, stop
     require_file(repo_root / "train_amr_dygformer.py")
     require_file(repo_root / "evaluate_policy_selector.py")
     require_file(repo_root / "optimize_policy_milp.py")
+    require_file(repo_root / "evaluate_policy_milp_c5.py")
     require_file(repo_root / str(CONFIG["DATASET"]["candidate_interventions_json"]))
     require_file(_milp_config_json(repo_root))
 
     paths = _paths(results_parent)
     report = Report(paths["track_root"] / f"run_report_{paths['track_root'].name}.txt", dry=dry)
     started = time.time()
-    total_steps = 4
+    total_steps = 5
 
     def write_progress(status: str, completed_steps: int, active_step: str) -> None:
         _write_track_progress_state(
@@ -1096,6 +1153,16 @@ def _execute_single_track(results_parent: Path, dry: bool, start_step: int, stop
         run_cmd(_build_milp_cmd(repo_root, paths), cwd=repo_root, dry=dry, report=report, stream_output=False)
     else:
         report.write("STEP C4 skipped by start/stop range")
+    report.update_step_console(current=1, total=1, extra="done")
+    report.finish_step_console(force_complete=True)
+
+    report.section("STEP C5 | quantitative MILP evaluation", total=1)
+    report.kv("c5_root", paths["c5_root"])
+    if start_step <= 5 <= stop_step:
+        write_progress("running", 4, "STEP C5 quantitative MILP evaluation")
+        run_cmd(_build_c5_cmd(repo_root, paths), cwd=repo_root, dry=dry, report=report, stream_output=False)
+    else:
+        report.write("STEP C5 skipped by start/stop range")
     report.update_step_console(current=1, total=1, extra="done")
     report.finish_step_console(force_complete=True)
 
@@ -1174,14 +1241,14 @@ def _launch_parallel_tracks(args: argparse.Namespace, results_parent: Path) -> i
                         "track_name": f"TRACK_{state_mode}",
                         "status": "pending" if proc.poll() is None else ("done" if proc.returncode == 0 else "failed"),
                         "completed_steps": 0,
-                        "total_steps": 4,
+                        "total_steps": 5,
                         "active_step": "starting" if proc.poll() is None else "complete",
                         "elapsed_sec": 0.0,
                     }
                 if proc.poll() is not None:
                     if proc.returncode == 0:
                         state["status"] = "done"
-                        state["completed_steps"] = state.get("total_steps", 4)
+                        state["completed_steps"] = state.get("total_steps", 5)
                         state["active_step"] = "complete"
                     else:
                         state["status"] = "failed"
@@ -1242,6 +1309,22 @@ def _launch_parallel_tracks(args: argparse.Namespace, results_parent: Path) -> i
     if interrupted:
         return 1
 
+    if not failures and not bool(args.dry_run) and int(args.start) <= 5 <= int(args.stop):
+        parent_report.write("Collating C5 outputs across ground-truth and partial-observation tracks.")
+        run_cmd(
+            [
+                sys.executable,
+                "evaluate_policy_milp_c5.py",
+                "--collate_parent", str(results_parent),
+                "--c5_dir_name", _safe_tag(str(CONFIG["C5"]["out_name"])),
+                "--out_dir", str(results_parent / "C5_MANUSCRIPT_BUNDLE"),
+            ],
+            cwd=repo_root,
+            dry=False,
+            report=parent_report,
+            stream_output=False,
+        )
+
     parent_report.update_step_console(
         current=1 if not failures else 0,
         total=1,
@@ -1260,12 +1343,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--emit_latex", action="store_true")
     parser.add_argument("--emit_latex_only", action="store_true")
     parser.add_argument("--overleaf_dir", type=str, default="")
-    parser.add_argument("--start", type=int, default=1, choices=[1, 2, 3, 4])
-    parser.add_argument("--stop", type=int, default=4, choices=[1, 2, 3, 4])
+    parser.add_argument("--start", type=int, default=1, choices=[1, 2, 3, 4, 5])
+    parser.add_argument("--stop", type=int, default=5, choices=[1, 2, 3, 4, 5])
     return parser
 
 
 def main() -> int:
+    if "--causal_repeats" in sys.argv[1:]:
+        from causal_repeats import main as repeat_main
+        return repeat_main([a for a in sys.argv[1:] if a != "--causal_repeats"])
     args = build_parser().parse_args()
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)

@@ -111,6 +111,21 @@ def parse_num_neighbors(s: Optional[str]) -> List[int]:
     return out
 
 
+def set_experiment_seed(seed: Optional[int], deterministic: bool = False) -> None:
+    """Opt-in RNG/backend control; split_seed remains a distinct setting."""
+    if seed is not None:
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+
+
 def configure_cpu_threads(cpu_threads: int) -> int:
     cpu_threads = max(1, int(cpu_threads))
     os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
@@ -3342,6 +3357,11 @@ def main():
     parser.add_argument("--oracle_best_action_loss", type=str2bool, default=True, help="If true, add a direct within-state softmax cross-entropy loss over candidate actions using the same utility score used for policy selection.")
     parser.add_argument("--oracle_best_action_loss_weight", type=float, default=1.0, help="Weight for the within-state oracle-best-action softmax cross-entropy loss.")
     parser.add_argument("--require_complete_action_set", type=str2bool, default=True, help="If true in policy-manifest mode, drop any state whose observed action rows do not exactly match the global expected action menu.")
+    parser.add_argument("--model_seed", type=int, default=None)
+    parser.add_argument("--eval_seed", type=int, default=None)
+    parser.add_argument("--deterministic", type=str2bool, default=False)
+    parser.add_argument("--metrics_only", type=str2bool, default=False,
+                        help="Skip attention/attribution exports after saving metrics.")
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--use_task_hparams", action="store_true")
 
@@ -3382,6 +3402,7 @@ def main():
     parser.add_argument("--lr_scheduler_min_lr", type=float, default=1e-6)
 
     args = parser.parse_args()
+    set_experiment_seed(args.model_seed, bool(args.deterministic))
     args.cpu_threads = configure_cpu_threads(args.cpu_threads)
     args.data_folder = os.path.abspath(args.data_folder)
     if args.test_folder is not None:
@@ -3910,6 +3931,7 @@ def main():
         state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
 
+    set_experiment_seed(args.eval_seed)
     _, _, val_y_hat_all, val_graphs_list, val_labels_all = eval_epoch(
         model=model,
         task=task,
@@ -3939,6 +3961,7 @@ def main():
     test_labels_all = None
 
     if test_loader is not None:
+        set_experiment_seed(args.eval_seed)
         _, _, test_y_hat_all, test_graphs_list, test_labels_all = eval_epoch(
             model=model,
             task=task,
@@ -3991,6 +4014,10 @@ def main():
             "seed_strategy": str(args.seed_strategy),
             "seed_batch_size": int(args.seed_batch_size),
             "max_sub_batches": int(args.max_sub_batches),
+            "model_seed": args.model_seed,
+            "eval_seed": args.eval_seed,
+            "deterministic": bool(args.deterministic),
+            "metrics_only": bool(args.metrics_only),
             "split_seed": int(args.split_seed),
             "train_model": bool(args.train_model),
             "emit_translational_figures": bool(args.emit_translational_figures),
@@ -4214,6 +4241,9 @@ def main():
             plt.close()
 
     _write_run_summary_files(out_dir=out_dir, summary=run_summary)
+    if args.metrics_only:
+        print(f"Metrics and checkpoint saved to {out_dir}", flush=True)
+        return
 
     # -------------------------------------------------------------------------
     # RESTORED: Attention heatmaps (node attention vs performance)

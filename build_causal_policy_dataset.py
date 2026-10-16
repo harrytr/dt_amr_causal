@@ -485,6 +485,16 @@ def _prepare_arm(
     state_mode: str,
     force: bool,
 ) -> None:
+    # Verified repeat caching is isolated from the legacy build path.
+    import os
+    if os.environ.get("DT_CAUSAL_REPEAT_CONTEXT"):
+        from causal_repeat_cache import prepare_arm_cached
+        return prepare_arm_cached(
+            python_bin=python_bin, out_dir=out_dir, seed=seed, pair_id=pair_id,
+            role=role, shared_noise_seed=shared_noise_seed,
+            intervention_json=intervention_json, sim_args=sim_args,
+            horizons=horizons, state_mode=state_mode, force=force,
+        )
     if force and out_dir.exists():
         shutil.rmtree(out_dir)
     _safe_mkdir(out_dir)

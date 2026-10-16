@@ -1760,10 +1760,13 @@ def _multiclass_state_metrics(
         fp = float(cm[:, k].sum() - tp)
         tn = float(total - tp - fn - fp)
 
-        prec = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+        # Conventional macro precision: a supported class that is never predicted receives precision 0.
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         rec = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
         spec = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-        f1 = (2.0 * prec * rec / (prec + rec)) if np.isfinite(prec) and np.isfinite(rec) and (prec + rec) > 0 else float("nan")
+        # Count-based F1 retains zero scores for missed or misclassified actions.
+        f1_denominator = 2.0 * tp + fp + fn
+        f1 = 2.0 * tp / f1_denominator if f1_denominator > 0 else 0.0
 
         precisions.append(prec)
         recalls.append(rec)
@@ -1854,10 +1857,13 @@ def _multiclass_state_metrics_tie_aware(
         fp = float(cm[:, k].sum() - tp)
         tn = float(total - tp - fn - fp)
 
-        prec = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+        # Conventional macro precision: a supported class that is never predicted receives precision 0.
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         rec = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
         spec = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
-        f1 = (2.0 * prec * rec / (prec + rec)) if np.isfinite(prec) and np.isfinite(rec) and (prec + rec) > 0 else float("nan")
+        # Count-based F1 retains zero scores for missed or misclassified actions.
+        f1_denominator = 2.0 * tp + fp + fn
+        f1 = 2.0 * tp / f1_denominator if f1_denominator > 0 else 0.0
 
         precisions.append(prec)
         recalls.append(rec)
@@ -2098,7 +2104,18 @@ def main() -> int:
         type=str,
         help="Optional path to candidate_interventions.json. If provided, dashboard labels prefer display_name/label from that file.",
     )
+    parser.add_argument("--eval_seed", type=int, default=None)
+    parser.add_argument("--deterministic", type=str2bool, default=False)
+    parser.add_argument("--cpu_threads", type=int, default=None)
+    parser.add_argument("--metrics_only", type=str2bool, default=False,
+                        help="Evaluate the requested split only and skip plot exports.")
     args = parser.parse_args()
+    if args.eval_seed is not None or args.deterministic:
+        from train_amr_dygformer import set_experiment_seed
+        set_experiment_seed(args.eval_seed, bool(args.deterministic))
+    if args.cpu_threads is not None:
+        from train_amr_dygformer import configure_cpu_threads
+        configure_cpu_threads(args.cpu_threads)
 
     data_folder = os.path.abspath(args.data_folder)
     trained_dir = os.path.abspath(args.trained_dir)
@@ -2148,7 +2165,7 @@ def main() -> int:
         raise ValueError(f"No rows found for split='{split_name}' in policy manifest: {data_folder}")
 
     # Always also load train rows so Panel A can compare train vs test/train.
-    extra_plot_splits = ["train"]
+    extra_plot_splits = [] if args.metrics_only else ["train"]
     plot_idxs: List[int] = []
     seen_plot_idx = set()
 
@@ -2489,6 +2506,9 @@ def main() -> int:
     oracle_action_display_counts = _zero_filled_display_counts(expected_action_ids_ordered, action_label_map_full, metric_oracle_action_counts)
 
     summary = {
+        "eval_seed": args.eval_seed,
+        "deterministic": bool(args.deterministic),
+        "metrics_only": bool(args.metrics_only),
         "trained_dir": trained_dir,
         "data_folder": data_folder,
         "split": split_name,
@@ -2568,6 +2588,10 @@ def main() -> int:
             writer.writeheader()
             for row in raw_requested_split_records:
                 writer.writerow(row)
+
+    if args.metrics_only:
+        print(f"Policy metrics saved to {out_dir}", flush=True)
+        return 0
 
     # Publication-style summary plots
     _plot_action_selection_confusion(
