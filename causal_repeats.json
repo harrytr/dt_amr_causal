@@ -1,0 +1,25 @@
+{
+  "description": "Five joint repetitions of the causal C1--C4 design, T=7/H=7, both observation tracks; exploratory local parameter sensitivity.",
+  "simulation_seed_offsets": [100000, 200000, 300000, 400000, 500000],
+  "model_seeds": [302601, 302602, 302603, 302604, 302605],
+  "parameter_seed": 302607,
+  "parameter_multipliers": {
+    "resistant_transmission": [0.9, 1.1],
+    "resistant_admission_weights": [0.9, 1.1],
+    "turnover": [0.9, 1.1]
+  },
+  "parameter_rationale": "Exploratory local sensitivity example: independent Uniform(0.9,1.1) multipliers around the baseline regime's resistant transmission, resistant admission weights and turnover fraction. This modest perturbation retains the original regime and action menu. It is not an empirically calibrated parameter distribution. Each draw applies identically to all splits and factual/counterfactual arms within a repetition and both observation tracks; intervention definitions remain fixed. Replace the example ranges before starting if justified alternatives are available.",
+  "tracks": ["ground_truth", "partial_observation"],
+  "shared_noise_seed_offset": 910000,
+  "bootstrap_replicates": 1000,
+  "bootstrap_seed": 302609,
+  "deterministic": true,
+  "threads": 4,
+  "dataset_jobs": 4,
+  "conversion_workers": 0,
+  "run_milp": true,
+  "keep_raw_graphml": false,
+  "keep_action_full_pt": false,
+  "train_overrides": {},
+  "milp_overrides": {}
+}
